@@ -1,0 +1,1326 @@
+openapi: 3.1.0
+info:
+  title: Golalita Loyalty Platform API
+  version: 0.1.0-draft
+  summary: Merchant-owned loyalty programs (points, tiers, punch cards, wallet passes).
+  description: |
+    Draft contract for the new Node.js loyalty backend.
+
+    **Consumers**
+    - Golalita Merchant App (React Native): the "Loyalty Program" drawer section. Uses `merchantAuth`.
+    - Customer sign-up website (opened from the branch QR). Uses `memberAuth` after OTP.
+
+    **Ground rules**
+    - Loyalty members are owned by one merchant and are never linked to Golalita (Odoo) customers.
+      The same phone at two merchants is two unrelated members.
+    - Merchant identity always comes from the server-side Odoo token check in `/auth/exchange`,
+      never from a request body.
+    - Money is sent as a decimal string in QAR (e.g. `"45.50"`) to avoid float rounding.
+    - Errors use RFC 9457 `application/problem+json` with a stable machine-readable `code`.
+    - The printed branch QR only opens the sign-up page. It never awards points or stamps.
+    - **Roles:** every `merchantAuth` operation is allowed for `owner` and `cashier` unless it has
+      `x-roles: [owner]`. The backend enforces this; hiding screens in the app is not enough.
+    - Every `merchantAuth` operation can also return `401` (`unauthorized`, `token_expired`) and
+      `403` (`forbidden_role`), even where not listed.
+    - **Proof of presence:** points and stamps are only awarded with a `lookupToken` from a counter
+      lookup, so a cashier cannot credit or redeem for a member who isn't there.
+
+    **Open decisions (marked `OPEN:` below)**
+    1. Members per merchant (assumed here) or per branch.
+    2. wallet-api capabilities: updating issued passes, native Google Wallet, branding, barcode value, banner per stamp count.
+    3. Roles: does Odoo distinguish owner and cashier logins? Assumed here: `owner` and `cashier`.
+    4. What Odoo `/user/vendor/get_token_duplicate` returns (must include the vendor/merchant id).
+    5. Wallet pass barcodes are static (they change only when the pass is updated), so a screenshot of a
+       pass keeps working. Acceptable if wallet-api can rotate the barcode on each pass update.
+    6. Whether a tier reached on a bill applies to that bill or from the next visit (assumed: next visit).
+servers:
+  - url: https://loyalty-api.golalita.com/v1
+    description: Production (placeholder host)
+  - url: http://localhost:4000/v1
+    description: Local development
+
+tags:
+  - name: Auth
+  - name: Merchant
+  - name: Program
+  - name: Card design
+  - name: Branches
+  - name: Counter
+  - name: Members
+  - name: Public sign-up
+
+security:
+  - merchantAuth: []
+
+paths:
+  # ───────────────────────────── Auth ─────────────────────────────
+  /auth/exchange:
+    post:
+      tags: [Auth]
+      operationId: exchangeOdooToken
+      summary: Exchange the merchant's Odoo token for loyalty tokens
+      description: |
+        The server validates `odooToken` by calling Odoo `POST /go/api/user/vendor/get_token_duplicate`
+        server-to-server, reads the merchant id from Odoo's reply, and creates or updates the local merchant
+        record keyed by `odooMerchantId` (Odoo `tracking_partner_id`). Role comes from Odoo `main_member`:
+        true = `owner`, otherwise `cashier`. Branches are synced from Odoo on first exchange.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [odooToken]
+              properties:
+                odooToken: { type: string, minLength: 1 }
+            example: { odooToken: "f3a9c2…" }
+      responses:
+        '200':
+          description: Tokens issued
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenPair' }
+              example:
+                accessToken: "eyJhbGciOi…"
+                accessTokenExpiresIn: 900
+                refreshToken: "rt_9b1f…"
+                merchant: { id: "mer_01J9Z", odooMerchantId: 4812, name: "Cup & Go", role: owner, loyaltyEnabled: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: "`not_a_merchant` (Odoo user has no tracking_partner_id) or `staff_disabled`. Login succeeds even when loyalty is off; check `merchant.loyaltyEnabled`, and loyalty endpoints return 403 `loyalty_not_enabled`."
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      operationId: refreshToken
+      summary: Rotate the refresh token and issue a new access token
+      description: Refresh tokens are single-use. Reusing an old one revokes the whole token family.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+      responses:
+        '200':
+          description: New token pair
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenPair' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: Revoke the current refresh token family
+      responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '204': { description: Logged out }
+
+  # ──────────────────────────── Merchant ────────────────────────────
+  /merchant/me:
+    get:
+      tags: [Merchant]
+      operationId: getCurrentMerchant
+      summary: Current merchant, role and feature flags
+      description: The app uses `loyaltyEnabled` to show or hide the drawer item.
+      responses:
+        '200':
+          description: Merchant
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Merchant' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ──────────────────────────── Program ────────────────────────────
+  /program:
+    get:
+      tags: [Program]
+      operationId: getProgram
+      summary: Program settings
+      responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '200':
+          description: Program
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Program' }
+    put:
+      tags: [Program]
+      operationId: updateProgram
+      x-roles: [owner]
+      summary: Update program settings (owner only)
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProgramInput' }
+      responses:
+        '200':
+          description: Updated program
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Program' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /program/tiers:
+    get:
+      tags: [Program]
+      operationId: listTiers
+      summary: Tiers in ascending order, each with its punch rule
+      responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '200':
+          description: Tiers
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, version]
+                properties:
+                  version: { type: integer }
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Tier' }
+              example:
+                version: 3
+                items:
+                  - { id: tier_green, nameEn: Green, nameAr: أخضر, color: "#7E9D77", spendThreshold: "0.00", discountPercent: 0, isBase: true, rank: 0,
+                      punchRule: { enabled: true, stampsRequired: 6, rewardDescriptionEn: "7th drink free", rewardDescriptionAr: "المشروب السابع مجاناً" } }
+                  - { id: tier_silver, nameEn: Silver, nameAr: فضي, color: "#8A8A8A", spendThreshold: "75.00", discountPercent: 10, isBase: false, rank: 1,
+                      punchRule: { enabled: true, stampsRequired: 5, rewardDescriptionEn: "6th drink free", rewardDescriptionAr: "المشروب السادس مجاناً" } }
+    put:
+      tags: [Program]
+      operationId: replaceTiers
+      x-roles: [owner]
+      summary: Replace the full tier list (owner only)
+      description: |
+        Replaces all tiers atomically. Exactly one tier must have `isBase: true` with `spendThreshold` "0.00".
+        Thresholds must strictly increase with `rank`. Tiers that still have members cannot be deleted;
+        send `reassignToTierId` for removed tiers or the request fails with `tier_in_use`.
+        Changing tiers queues a pass update for affected members.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [items]
+              properties:
+                items:
+                  type: array
+                  minItems: 1
+                  maxItems: 8
+                  items: { $ref: '#/components/schemas/TierInput' }
+                reassignToTierId: { type: string }
+      responses:
+        '200':
+          description: Saved tiers
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version: { type: integer }
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Tier' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  # ─────────────────────────── Card design ───────────────────────────
+  /assets:
+    post:
+      tags: [Card design]
+      operationId: uploadAsset
+      x-roles: [owner]
+      summary: Upload an image for the card (owner only)
+      description: |
+        The server checks type, size and dimensions with `sharp` and stores the file.
+        Size rules per `kind`:
+        - `logo`: PNG, at least 480×150, max 1 MB
+        - `banner`: PNG/JPEG, exactly 1125×432 (Apple storeCard strip @3x), max 2 MB
+        - `stamp_filled`, `stamp_empty`: PNG with transparency, square, at least 180×180, max 300 KB
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [kind, file]
+              properties:
+                kind: { $ref: '#/components/schemas/AssetKind' }
+                file: { type: string, contentMediaType: application/octet-stream }
+      responses:
+        '201':
+          description: Stored asset
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Asset' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '413': { $ref: '#/components/responses/ValidationError' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /card-design:
+    get:
+      tags: [Card design]
+      operationId: getCardDesign
+      summary: Current card design
+      responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '200':
+          description: Card design
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CardDesign' }
+    put:
+      tags: [Card design]
+      operationId: updateCardDesign
+      x-roles: [owner]
+      summary: Update card design (owner only)
+      description: Saving a new design queues a pass update for every member.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CardDesignInput' }
+      responses:
+        '200':
+          description: Updated design
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CardDesign' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /card-design/preview:
+    post:
+      tags: [Card design]
+      operationId: previewCardDesign
+      x-roles: [owner]
+      summary: Render a preview image of the card without saving
+      description: Lets the app show exactly what the pass banner will look like for a given stamp count.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/CardDesignInput'
+                - type: object
+                  properties:
+                    sampleStamps: { type: integer, minimum: 0, default: 3 }
+                    sampleTierId: { type: string }
+      responses:
+        '200':
+          description: Preview PNG
+          content:
+            image/png:
+              schema: { type: string, contentMediaType: image/png }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  # ──────────────────────────── Branches ────────────────────────────
+  /branches:
+    get:
+      tags: [Branches]
+      operationId: listBranches
+      summary: Branches (synced from Odoo)
+      responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '200':
+          description: Branches
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Branch' }
+
+  /branches/sync:
+    post:
+      tags: [Branches]
+      operationId: syncBranches
+      x-roles: [owner]
+      summary: Re-sync branches from Odoo now (owner only)
+      description: Requires a fresh Odoo token because the server reads branches from Odoo on the merchant's behalf.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [odooToken]
+              properties:
+                odooToken: { type: string }
+      responses:
+        '200':
+          description: Branches after sync
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Branch' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
+  /branches/{branchId}/qr:
+    get:
+      tags: [Branches]
+      operationId: getBranchQr
+      summary: Sign-up URL and poster content for a branch
+      description: |
+        The app renders the QR from `joinUrl`; it never builds the URL itself.
+        `joinUrl` uses public codes, not internal or Odoo ids, so branches cannot be enumerated.
+      parameters:
+        - $ref: '#/components/parameters/BranchId'
+      responses:
+        '200':
+          description: QR payload
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BranchQr' }
+              example:
+                branchId: br_01J9Z
+                joinUrl: "https://join.golalita.com/j/cupgo/lsl7q?src=branch_qr"
+                poster:
+                  headlineEn: "Join Cup & Go Loyalty Program"
+                  headlineAr: "انضم إلى برنامج الولاء"
+                  logoUrl: "https://cdn.golalita.com/loyalty/mer_01J9Z/logo.png"
+                  primaryColor: "#7E9D77"
+                  tiers: [{ nameEn: Green, discountPercent: 0 }, { nameEn: Silver, discountPercent: 10 }]
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ──────────────────────────── Counter ────────────────────────────
+  /scan/lookup:
+    post:
+      tags: [Counter]
+      operationId: lookupScannedCode
+      summary: Identify a member from a scanned pass or web-card code
+      description: |
+        Accepts codes with the `glp1.` prefix (signed member token). Codes for another merchant fail with
+        `wrong_merchant`; expired rotating web-card codes fail with `code_expired`.
+        Read-only: nothing is awarded here. Returns a `lookupToken` that `POST /transactions` needs.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code, branchId]
+              properties:
+                code: { type: string, pattern: '^glp1\.' }
+                branchId: { type: string }
+      responses:
+        '200':
+          description: Member summary for the cashier
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScanLookupResult' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: "`wrong_merchant`, `member_blocked`"
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '410':
+          description: "`code_expired`"
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /members/lookup-by-phone:
+    post:
+      tags: [Counter]
+      operationId: lookupMemberByPhone
+      summary: Find a member by phone when they cannot show their card
+      description: |
+        For members who can't show their card. Only available when `program.allowPhoneLookup` is true,
+        and limited to `program.phoneLookupDailyLimit` per cashier per day. The returned `lookupToken`
+        has `canRedeem: false`: phone lookups can earn but never redeem a reward.
+        Returns only a masked summary.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone, branchId]
+              properties:
+                phone: { $ref: '#/components/schemas/Phone' }
+                branchId: { type: string }
+      responses:
+        '200':
+          description: Member summary
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScanLookupResult' }
+        '403':
+          description: "`phone_lookup_disabled`"
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /transactions:
+    post:
+      tags: [Counter]
+      operationId: createTransaction
+      summary: Record a purchase (earn) and optionally redeem a stamp reward
+      description: |
+        One call per bill. In a single database transaction the server:
+        1. checks `invoiceRef` is unique for this merchant,
+        2. applies the member's current tier discount (`OPEN:` whether a tier reached by this same bill applies now or next visit; assumed next visit),
+        3. awards points and stamps (stamps capped by `program.maxStampsPerTransaction`),
+        4. redeems the stamp reward if `redeemStampReward` is true and the member is eligible,
+        5. re-evaluates the tier and writes an outbox entry for the wallet pass update.
+
+        **Idempotency:** `Idempotency-Key` is required and scoped to the merchant; keys are kept for 24 h.
+        Retrying with the same key and body returns the original result with status 200; the same key with
+        a different body returns 422 `idempotency_mismatch`. The app creates one key per bill and reuses it on retry.
+
+        **Presence:** `lookupToken` is single-use, valid for 5 minutes, and bound to the member, branch and
+        cashier that did the lookup. Expired or reused tokens fail with 409 `lookup_expired`; a token from a
+        phone lookup with `redeemStampReward: true` fails with 409 `redeem_requires_scan`.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransactionInput' }
+            example:
+              lookupToken: "lk_7Hq2…"
+              branchId: br_01J9Z
+              invoiceRef: "POS-000123"
+              billAmount: "42.00"
+              stampItems: 2
+              redeemStampReward: false
+      responses:
+        '201':
+          description: Recorded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransactionResult' }
+        '200':
+          description: Replay of an earlier request with the same Idempotency-Key
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransactionResult' }
+        '409':
+          description: "`duplicate_invoice`, `reward_not_eligible`, `member_blocked`, `lookup_expired`, `redeem_requires_scan`"
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    get:
+      tags: [Counter]
+      operationId: listTransactions
+      summary: Transaction history for the merchant
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: branchId
+          in: query
+          schema: { type: string }
+        - name: memberId
+          in: query
+          schema: { type: string }
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '200':
+          description: Page of transactions
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Transaction' }
+                  nextCursor: { type: [string, 'null'] }
+
+  /transactions/{transactionId}/void:
+    post:
+      tags: [Counter]
+      operationId: voidTransaction
+      x-roles: [owner]
+      summary: Reverse a transaction entered by mistake (owner only)
+      description: Writes a compensating ledger entry; the original is never edited or deleted. Balances may not go negative.
+      parameters:
+        - name: transactionId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string, minLength: 3, maxLength: 200 }
+      responses:
+        '200':
+          description: Voided
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Transaction' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  # ──────────────────────────── Members ────────────────────────────
+  /members:
+    get:
+      tags: [Members]
+      operationId: listMembers
+      summary: Members of this merchant
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: q
+          in: query
+          description: Name or last 4+ digits of phone
+          schema: { type: string, minLength: 2 }
+        - name: tierId
+          in: query
+          schema: { type: string }
+        - name: joinedBranchId
+          in: query
+          schema: { type: string }
+      responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '200':
+          description: Page of members
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/MemberSummary' }
+                  nextCursor: { type: [string, 'null'] }
+                  totals:
+                    type: object
+                    properties:
+                      members: { type: integer }
+                      byTier:
+                        type: object
+                        additionalProperties: { type: integer }
+
+  /members/{memberId}:
+    parameters:
+      - name: memberId
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [Members]
+      operationId: getMember
+      summary: Member detail
+      responses:
+        '200':
+          description: Member
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Member' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Members]
+      operationId: updateMemberStatus
+      x-roles: [owner]
+      summary: Block or unblock a member (owner only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [active, blocked] }
+                reason: { type: string, maxLength: 200 }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Member' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ───────────────────────── Public sign-up (website) ─────────────────────────
+  /public/join/{merchantCode}/{branchCode}:
+    get:
+      tags: [Public sign-up]
+      operationId: getJoinPage
+      summary: Branding and tier info for the sign-up page
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/MerchantCode'
+        - $ref: '#/components/parameters/BranchCode'
+      responses:
+        '200':
+          description: Page data
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JoinPage' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /public/otp/send:
+    post:
+      tags: [Public sign-up]
+      operationId: sendOtp
+      summary: Send an OTP to the customer's phone (sign-up and card recovery)
+      description: |
+        Same call for new and returning customers; the response does not reveal whether the phone is already a member.
+        Limits: 3 sends per phone per 15 min, 10 per IP per hour, 60 s between resends.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [merchantCode, branchCode, phone]
+              properties:
+                merchantCode: { type: string }
+                branchCode: { type: string }
+                phone: { $ref: '#/components/schemas/Phone' }
+                locale: { type: string, enum: [en, ar], default: en }
+                captchaToken: { type: string, description: Bot check (e.g. Cloudflare Turnstile); required once abuse is detected from an IP }
+      responses:
+        '202':
+          description: OTP sent
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [otpRequestId, resendAfterSeconds, expiresInSeconds]
+                properties:
+                  otpRequestId: { type: string }
+                  resendAfterSeconds: { type: integer }
+                  expiresInSeconds: { type: integer }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /public/otp/verify:
+    post:
+      tags: [Public sign-up]
+      operationId: verifyOtp
+      summary: Verify the OTP and get a member session
+      description: |
+        If the phone is already a member of this merchant, returns that member (card recovery).
+        Otherwise returns `profileRequired: true`; the site must then call `PUT /public/me`.
+        Max 5 attempts per OTP.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [otpRequestId, code]
+              properties:
+                otpRequestId: { type: string }
+                code: { type: string, pattern: '^[0-9]{4,6}$' }
+      responses:
+        '200':
+          description: Verified
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [memberToken, memberTokenExpiresAt, profileRequired]
+                properties:
+                  memberToken:
+                    type: string
+                    description: |
+                      Long-lived token (180 days) the website keeps in the browser so the web card opens without a new OTP.
+                      Scoped to one member of one merchant. Verifying the phone again issues a new token and revokes older ones.
+                  memberTokenExpiresAt: { type: string, format: date-time }
+                  profileRequired: { type: boolean }
+        '401':
+          description: "`otp_invalid`, `otp_expired`, `otp_attempts_exceeded`"
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /public/me:
+    get:
+      tags: [Public sign-up]
+      operationId: getMyCard
+      summary: The member's card (web card fallback)
+      security:
+        - memberAuth: []
+      responses:
+        '200':
+          description: Card
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MemberCard' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    put:
+      tags: [Public sign-up]
+      operationId: completeProfile
+      summary: Create the membership with name and consent (new members)
+      security:
+        - memberAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [firstName, consentAccepted]
+              properties:
+                firstName: { type: string, minLength: 1, maxLength: 60 }
+                lastName: { type: string, maxLength: 60 }
+                email: { type: string, format: email }
+                birthDate: { type: string, format: date }
+                consentAccepted: { type: boolean, const: true }
+                consentVersion: { type: string, description: "Version of the merchant's terms shown on the page, stored with the consent" }
+                marketingOptIn: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Member card
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MemberCard' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /public/me/qr:
+    get:
+      tags: [Public sign-up]
+      operationId: getMyRotatingCode
+      summary: Short-lived code for the web card's QR (refresh every ~60 s)
+      security:
+        - memberAuth: []
+      responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '200':
+          description: Code
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, expiresAt]
+                properties:
+                  code: { type: string, examples: ["glp1.eyJtIjoi…"] }
+                  expiresAt: { type: string, format: date-time }
+
+  /public/me/wallet:
+    get:
+      tags: [Public sign-up]
+      operationId: getMyWalletLinks
+      summary: Add-to-wallet links (issued through wallet-api)
+      description: "`OPEN:` exact shape depends on wallet-api (pkpass download vs. Google Wallet save link)."
+      security:
+        - memberAuth: []
+      responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '200':
+          description: Links
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  appleWalletUrl: { type: [string, 'null'], format: uri }
+                  googleWalletUrl: { type: [string, 'null'], format: uri }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
+components:
+  securitySchemes:
+    merchantAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Access token from /auth/exchange. Claims include merchantId, role (owner|cashier), odooMerchantId.
+    memberAuth:
+      type: http
+      scheme: bearer
+      description: memberToken from /public/otp/verify. Scoped to one member of one merchant.
+
+  parameters:
+    BranchId:
+      name: branchId
+      in: path
+      required: true
+      schema: { type: string }
+    MerchantCode:
+      name: merchantCode
+      in: path
+      required: true
+      schema: { type: string, pattern: '^[a-z0-9-]{3,32}$' }
+    BranchCode:
+      name: branchCode
+      in: path
+      required: true
+      schema: { type: string, pattern: '^[a-z0-9]{4,12}$' }
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    IfMatch:
+      name: If-Match
+      in: header
+      required: false
+      description: The `version` you last read. Prevents two devices overwriting each other's settings.
+      schema: { type: string }
+
+  responses:
+    Unauthorized:
+      description: Missing, invalid or expired token (`code` = `unauthorized` | `token_expired`)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Forbidden:
+      description: Role not allowed (`code` = `forbidden_role`)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: Not found
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Conflict:
+      description: Conflicts with current state
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    PreconditionFailed:
+      description: "`version_mismatch`: someone else saved first; reload and retry"
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    ValidationError:
+      description: Invalid input; `errors` lists each field
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    TooManyRequests:
+      description: Rate limited
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    UpstreamError:
+      description: Odoo or wallet-api failed (`code` = `odoo_unavailable` | `wallet_unavailable`)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri, default: about:blank }
+        title: { type: string }
+        status: { type: integer }
+        code: { type: string, description: Stable machine-readable error code }
+        detail: { type: string }
+        messageAr: { type: string, description: Arabic message safe to show to users }
+        errors:
+          type: array
+          items:
+            type: object
+            required: [field, code]
+            properties:
+              field: { type: string }
+              code: { type: string }
+              message: { type: string }
+
+    Money:
+      type: string
+      pattern: '^\d{1,7}\.\d{2}$'
+      description: QAR amount with exactly two decimals
+      examples: ["45.50"]
+
+    Phone:
+      type: string
+      pattern: '^\+974[3-7]\d{7}$'
+      description: E.164 Qatar mobile number
+      examples: ["+97455123456"]
+
+    Role:
+      type: string
+      enum: [owner, cashier]
+
+    TokenPair:
+      type: object
+      required: [accessToken, accessTokenExpiresIn, refreshToken, merchant]
+      properties:
+        accessToken: { type: string }
+        accessTokenExpiresIn: { type: integer, description: Seconds }
+        refreshToken: { type: string }
+        merchant: { $ref: '#/components/schemas/Merchant' }
+
+    Merchant:
+      type: object
+      required: [id, odooMerchantId, name, role, loyaltyEnabled]
+      properties:
+        id: { type: string }
+        odooMerchantId: { type: integer }
+        name: { type: string }
+        role: { $ref: '#/components/schemas/Role' }
+        loyaltyEnabled: { type: boolean }
+        merchantCode: { type: string, description: Public code used in join URLs }
+        programStatus: { type: string, enum: [draft, active, paused] }
+
+    ProgramInput:
+      type: object
+      required: [status, pointsPerQar, pointsNameEn, pointsNameAr, tierWindow]
+      properties:
+        status: { type: string, enum: [draft, active, paused] }
+        pointsPerQar: { type: number, minimum: 0, maximum: 100, description: e.g. 1 = 1 point per QAR }
+        minBillForEarning: { $ref: '#/components/schemas/Money' }
+        pointsNameEn: { type: string, maxLength: 20 }
+        pointsNameAr: { type: string, maxLength: 20 }
+        tierWindow:
+          type: string
+          enum: [monthly, quarterly, lifetime]
+          description: Spend period used to evaluate tiers
+        tierCarryOver:
+          type: boolean
+          default: false
+          description: If false, everyone restarts at the base tier when a window ends
+        maxStampsPerTransaction: { type: integer, minimum: 1, maximum: 20, default: 5 }
+        invoiceRefRequired: { type: boolean, default: true }
+        allowPhoneLookup: { type: boolean, default: false, description: Let cashiers find members by phone when they can't show a card (earn only) }
+        phoneLookupDailyLimit: { type: integer, minimum: 0, maximum: 500, default: 20, description: Per cashier per day }
+        termsEn: { type: string, maxLength: 4000 }
+        termsAr: { type: string, maxLength: 4000 }
+
+    Program:
+      allOf:
+        - $ref: '#/components/schemas/ProgramInput'
+        - type: object
+          required: [version, updatedAt]
+          properties:
+            version: { type: integer }
+            updatedAt: { type: string, format: date-time }
+            currentWindowEndsAt: { type: [string, 'null'], format: date-time }
+
+    PunchRule:
+      type: object
+      required: [enabled, stampsRequired]
+      properties:
+        enabled: { type: boolean }
+        stampsRequired: { type: integer, minimum: 2, maximum: 20, description: "Buy N, get the next free" }
+        rewardDescriptionEn: { type: string, maxLength: 60 }
+        rewardDescriptionAr: { type: string, maxLength: 60 }
+        rewardMaxValue: { $ref: '#/components/schemas/Money' }
+
+    TierInput:
+      type: object
+      required: [nameEn, nameAr, color, spendThreshold, discountPercent, isBase, punchRule]
+      properties:
+        id: { type: string, description: Omit for a new tier }
+        nameEn: { type: string, maxLength: 20 }
+        nameAr: { type: string, maxLength: 20 }
+        color: { type: string, pattern: '^#[0-9A-Fa-f]{6}$' }
+        spendThreshold: { $ref: '#/components/schemas/Money' }
+        discountPercent: { type: number, minimum: 0, maximum: 100 }
+        isBase: { type: boolean }
+        punchRule: { $ref: '#/components/schemas/PunchRule' }
+
+    Tier:
+      allOf:
+        - $ref: '#/components/schemas/TierInput'
+        - type: object
+          required: [id, rank]
+          properties:
+            id: { type: string }
+            rank: { type: integer }
+            memberCount: { type: integer }
+
+    AssetKind:
+      type: string
+      enum: [logo, banner, stamp_filled, stamp_empty]
+
+    Asset:
+      type: object
+      required: [id, kind, url, width, height]
+      properties:
+        id: { type: string }
+        kind: { $ref: '#/components/schemas/AssetKind' }
+        url: { type: string, format: uri }
+        width: { type: integer }
+        height: { type: integer }
+        bytes: { type: integer }
+
+    CardDesignInput:
+      type: object
+      required: [logoAssetId, backgroundColor, foregroundColor, labelColor]
+      properties:
+        logoAssetId: { type: string }
+        bannerAssetId: { type: [string, 'null'] }
+        stampFilledAssetId: { type: [string, 'null'] }
+        stampEmptyAssetId: { type: [string, 'null'] }
+        backgroundColor: { type: string, pattern: '^#[0-9A-Fa-f]{6}$' }
+        foregroundColor: { type: string, pattern: '^#[0-9A-Fa-f]{6}$' }
+        labelColor: { type: string, pattern: '^#[0-9A-Fa-f]{6}$' }
+        cardTitleEn: { type: string, maxLength: 30 }
+        cardTitleAr: { type: string, maxLength: 30 }
+
+    CardDesign:
+      allOf:
+        - $ref: '#/components/schemas/CardDesignInput'
+        - type: object
+          required: [version]
+          properties:
+            version: { type: integer }
+            logoUrl: { type: string, format: uri }
+            bannerUrl: { type: [string, 'null'], format: uri }
+            stampFilledUrl: { type: [string, 'null'], format: uri }
+            stampEmptyUrl: { type: [string, 'null'], format: uri }
+
+    Branch:
+      type: object
+      required: [id, odooBranchId, name, branchCode, active]
+      properties:
+        id: { type: string }
+        odooBranchId: { type: integer }
+        name: { type: string }
+        nameAr: { type: string }
+        branchCode: { type: string, description: Public code used in join URLs }
+        active: { type: boolean }
+        memberCount: { type: integer }
+
+    BranchQr:
+      type: object
+      required: [branchId, joinUrl, poster]
+      properties:
+        branchId: { type: string }
+        joinUrl: { type: string, format: uri }
+        poster:
+          type: object
+          properties:
+            headlineEn: { type: string }
+            headlineAr: { type: string }
+            logoUrl: { type: string, format: uri }
+            primaryColor: { type: string }
+            tiers:
+              type: array
+              items:
+                type: object
+                properties:
+                  nameEn: { type: string }
+                  nameAr: { type: string }
+                  discountPercent: { type: number }
+                  spendThreshold: { $ref: '#/components/schemas/Money' }
+                  stampsRequired: { type: integer }
+
+    MemberSummary:
+      type: object
+      required: [id, displayName, phoneMasked, tierId, points, stamps, status]
+      properties:
+        id: { type: string }
+        displayName: { type: string }
+        phoneMasked: { type: string, examples: ["+974 •••• 3456"] }
+        tierId: { type: string }
+        tierNameEn: { type: string }
+        points: { type: integer }
+        stamps: { type: integer }
+        status: { type: string, enum: [active, blocked] }
+        joinedAt: { type: string, format: date-time }
+        lastVisitAt: { type: [string, 'null'], format: date-time }
+
+    Member:
+      allOf:
+        - $ref: '#/components/schemas/MemberSummary'
+        - type: object
+          properties:
+            joinedBranchId: { type: string }
+            source: { type: string, enum: [branch_qr, cashier, other] }
+            windowSpend: { $ref: '#/components/schemas/Money' }
+            lifetimeSpend: { $ref: '#/components/schemas/Money' }
+            rewardsRedeemed: { type: integer }
+            walletPass:
+              type: object
+              properties:
+                apple: { type: boolean }
+                google: { type: boolean }
+                lastSyncedAt: { type: [string, 'null'], format: date-time }
+                syncStatus: { type: string, enum: [ok, pending, failed, none] }
+
+    ScanLookupResult:
+      type: object
+      required: [lookupToken, lookupTokenExpiresAt, canRedeem, member, tier, stamps, stampsRequired, rewardAvailable]
+      properties:
+        lookupToken: { type: string, description: "Single-use, 5 min, bound to member + branch + cashier. Pass to POST /transactions" }
+        lookupTokenExpiresAt: { type: string, format: date-time }
+        canRedeem: { type: boolean, description: false when found by phone lookup }
+        member: { $ref: '#/components/schemas/MemberSummary' }
+        tier:
+          type: object
+          properties:
+            id: { type: string }
+            nameEn: { type: string }
+            nameAr: { type: string }
+            color: { type: string }
+            discountPercent: { type: number }
+        stamps: { type: integer }
+        stampsRequired: { type: integer }
+        rewardAvailable: { type: boolean }
+        rewardDescriptionEn: { type: string }
+        nextTier:
+          type: [object, 'null']
+          properties:
+            nameEn: { type: string }
+            spendRemaining: { $ref: '#/components/schemas/Money' }
+
+    TransactionInput:
+      type: object
+      required: [lookupToken, branchId, billAmount, stampItems]
+      properties:
+        lookupToken: { type: string, description: From /scan/lookup or /members/lookup-by-phone }
+        branchId: { type: string }
+        invoiceRef: { type: string, minLength: 1, maxLength: 40, description: Required when program.invoiceRefRequired }
+        billAmount: { $ref: '#/components/schemas/Money' }
+        stampItems: { type: integer, minimum: 0, description: Qualifying items on this bill; capped by maxStampsPerTransaction }
+        redeemStampReward: { type: boolean, default: false }
+        note: { type: string, maxLength: 200 }
+
+    TransactionResult:
+      type: object
+      required: [transaction, member, passUpdate]
+      properties:
+        transaction: { $ref: '#/components/schemas/Transaction' }
+        member: { $ref: '#/components/schemas/MemberSummary' }
+        tierChanged: { type: boolean }
+        passUpdate:
+          type: string
+          enum: [queued, not_issued]
+          description: The wallet pass is updated asynchronously through the outbox
+
+    Transaction:
+      type: object
+      required: [id, type, memberId, branchId, createdAt, createdBy]
+      properties:
+        id: { type: string }
+        type: { type: string, enum: [earn, redeem, earn_and_redeem, void, adjust] }
+        memberId: { type: string }
+        branchId: { type: string }
+        invoiceRef: { type: [string, 'null'] }
+        billAmount: { $ref: '#/components/schemas/Money' }
+        tierDiscountPercent: { type: number }
+        discountAmount: { $ref: '#/components/schemas/Money' }
+        pointsDelta: { type: integer }
+        stampsDelta: { type: integer }
+        rewardRedeemed: { type: boolean }
+        voidsTransactionId: { type: [string, 'null'] }
+        voidedByTransactionId: { type: [string, 'null'] }
+        createdAt: { type: string, format: date-time }
+        createdBy:
+          type: object
+          properties:
+            role: { $ref: '#/components/schemas/Role' }
+            odooUserId: { type: integer }
+            name: { type: string }
+
+    JoinPage:
+      type: object
+      required: [merchantName, branchName, design, tiers, programActive]
+      properties:
+        merchantName: { type: string }
+        branchName: { type: string }
+        programActive: { type: boolean }
+        welcomeEn: { type: string }
+        welcomeAr: { type: string }
+        termsEn: { type: string }
+        termsAr: { type: string }
+        design:
+          type: object
+          properties:
+            logoUrl: { type: string, format: uri }
+            primaryColor: { type: string }
+        tiers:
+          type: array
+          items:
+            type: object
+            properties:
+              nameEn: { type: string }
+              nameAr: { type: string }
+              discountPercent: { type: number }
+              spendThreshold: { $ref: '#/components/schemas/Money' }
+              punchRule: { $ref: '#/components/schemas/PunchRule' }
+
+    MemberCard:
+      type: object
+      required: [merchantName, firstName, tier, points, stamps, stampsRequired]
+      properties:
+        merchantName: { type: string }
+        firstName: { type: string }
+        pointsName: { type: string }
+        points: { type: integer }
+        stamps: { type: integer }
+        stampsRequired: { type: integer }
+        rewardAvailable: { type: boolean }
+        tier:
+          type: object
+          properties:
+            nameEn: { type: string }
+            nameAr: { type: string }
+            color: { type: string }
+            discountPercent: { type: number }
+        nextTier:
+          type: [object, 'null']
+          properties:
+            nameEn: { type: string }
+            spendRemaining: { $ref: '#/components/schemas/Money' }
+        windowEndsAt: { type: [string, 'null'], format: date-time }
+        design:
+          type: object
+          properties:
+            logoUrl: { type: string, format: uri }
+            bannerUrl: { type: [string, 'null'], format: uri }
+            backgroundColor: { type: string }

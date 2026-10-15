@@ -1,0 +1,378 @@
+// Golalita Loyalty Platform data model.
+// Every merchant-owned table carries merchantId; every query must filter by it.
+// Loyalty members are never linked to Golalita (Odoo) customers.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────────── Merchants & staff ─────────────────────────────
+
+model Merchant {
+  id             String   @id @default(cuid())
+  odooPartnerId  Int      @unique // Odoo tracking_partner_id
+  name           String
+  merchantCode   String   @unique // public code used in join URLs
+  loyaltyEnabled Boolean  @default(false)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  staff        Staff[]
+  branches     Branch[]
+  program      Program?
+  tiers        Tier[]
+  assets       Asset[]
+  cardDesign   CardDesign?
+  members      Member[]
+  transactions Transaction[]
+  events       Event[]
+}
+
+enum Role {
+  owner
+  cashier
+}
+
+model Staff {
+  id         String   @id @default(cuid())
+  merchantId String
+  odooUserId Int      @unique
+  name       String
+  role       Role
+  active     Boolean  @default(true)
+  lastSeenAt DateTime @default(now())
+  createdAt  DateTime @default(now())
+
+  merchant      Merchant       @relation(fields: [merchantId], references: [id])
+  refreshTokens RefreshToken[]
+
+  @@index([merchantId])
+}
+
+model RefreshToken {
+  id        String    @id @default(cuid())
+  staffId   String
+  familyId  String // all tokens from one login; reuse of an old one revokes the family
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  staff Staff @relation(fields: [staffId], references: [id], onDelete: Cascade)
+
+  @@index([familyId])
+}
+
+model Branch {
+  id           String   @id @default(cuid())
+  merchantId   String
+  odooBranchId Int      @unique
+  name         String
+  nameAr       String?
+  branchCode   String // public code used in join URLs
+  active       Boolean  @default(true)
+  syncedAt     DateTime @default(now())
+
+  merchant Merchant @relation(fields: [merchantId], references: [id])
+
+  @@unique([merchantId, branchCode])
+  @@index([merchantId])
+}
+
+// ──────────────────────────── Program configuration ────────────────────────────
+
+enum ProgramStatus {
+  draft
+  active
+  paused
+}
+
+enum TierWindow {
+  monthly
+  quarterly
+  lifetime
+}
+
+model Program {
+  merchantId              String        @id
+  version                 Int           @default(1)
+  status                  ProgramStatus @default(draft)
+  pointsPerQar            Decimal       @default(1) @db.Decimal(8, 2)
+  minBillForEarning       Decimal       @default(0) @db.Decimal(12, 2)
+  pointsNameEn            String        @default("Points")
+  pointsNameAr            String        @default("نقاط")
+  tierWindow              TierWindow    @default(monthly)
+  tierCarryOver           Boolean       @default(false)
+  maxStampsPerTransaction Int           @default(5)
+  invoiceRefRequired      Boolean       @default(true)
+  allowPhoneLookup        Boolean       @default(false)
+  phoneLookupDailyLimit   Int           @default(20)
+  termsEn                 String?
+  termsAr                 String?
+  termsVersion            Int           @default(1)
+  updatedAt               DateTime      @updatedAt
+
+  merchant Merchant @relation(fields: [merchantId], references: [id])
+}
+
+model Tier {
+  id              String   @id @default(cuid())
+  merchantId      String
+  rank            Int // 0 = base tier
+  isBase          Boolean  @default(false)
+  nameEn          String
+  nameAr          String
+  color           String
+  spendThreshold  Decimal  @db.Decimal(12, 2)
+  discountPercent Decimal  @db.Decimal(5, 2)
+  // Punch rule for members in this tier
+  punchEnabled    Boolean  @default(true)
+  stampsRequired  Int      @default(10)
+  rewardDescEn    String?
+  rewardDescAr    String?
+  rewardMaxValue  Decimal? @db.Decimal(12, 2)
+  deletedAt       DateTime?
+
+  merchant Merchant @relation(fields: [merchantId], references: [id])
+  members  Member[]
+
+  @@index([merchantId, rank])
+}
+
+enum AssetKind {
+  logo
+  banner
+  stamp_filled
+  stamp_empty
+}
+
+model Asset {
+  id         String    @id @default(cuid())
+  merchantId String
+  kind       AssetKind
+  storageKey String
+  url        String
+  width      Int
+  height     Int
+  bytes      Int
+  createdAt  DateTime  @default(now())
+
+  merchant Merchant @relation(fields: [merchantId], references: [id])
+
+  @@index([merchantId, kind])
+}
+
+model CardDesign {
+  merchantId         String   @id
+  version            Int      @default(1)
+  logoAssetId        String?
+  bannerAssetId      String?
+  stampFilledAssetId String?
+  stampEmptyAssetId  String?
+  backgroundColor    String   @default("#FFFFFF")
+  foregroundColor    String   @default("#000000")
+  labelColor         String   @default("#666666")
+  cardTitleEn        String?
+  cardTitleAr        String?
+  updatedAt          DateTime @updatedAt
+
+  merchant Merchant @relation(fields: [merchantId], references: [id])
+}
+
+// ─────────────────────────────── Members ───────────────────────────────
+
+enum MemberStatus {
+  active
+  blocked
+}
+
+enum MemberSource {
+  branch_qr
+  cashier
+  other
+}
+
+model Member {
+  id              String       @id @default(cuid())
+  merchantId      String
+  phone           String // E.164; unique per merchant only
+  firstName       String
+  lastName        String?
+  email           String?
+  birthDate       DateTime?    @db.Date
+  status          MemberStatus @default(active)
+  source          MemberSource @default(branch_qr)
+  joinedBranchId  String?
+  tierId          String
+  points          Int          @default(0)
+  stamps          Int          @default(0)
+  windowSpend     Decimal      @default(0) @db.Decimal(12, 2)
+  windowStartedAt DateTime     @default(now())
+  lifetimeSpend   Decimal      @default(0) @db.Decimal(12, 2)
+  rewardsRedeemed Int          @default(0)
+  consentVersion  Int
+  consentAt       DateTime
+  marketingOptIn  Boolean      @default(false)
+  lastVisitAt     DateTime?
+  joinedAt        DateTime     @default(now())
+
+  merchant     Merchant       @relation(fields: [merchantId], references: [id])
+  tier         Tier           @relation(fields: [tierId], references: [id])
+  transactions Transaction[]
+  memberTokens MemberToken[]
+  walletPass   WalletPass?
+
+  @@unique([merchantId, phone])
+  @@index([merchantId, tierId])
+}
+
+// Long-lived token the sign-up website keeps for the web card.
+model MemberToken {
+  id        String    @id @default(cuid())
+  memberId  String
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  member Member @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  @@index([memberId])
+}
+
+model OtpRequest {
+  id         String    @id @default(cuid())
+  merchantId String
+  branchId   String
+  phone      String
+  codeHash   String
+  attempts   Int       @default(0)
+  expiresAt  DateTime
+  verifiedAt DateTime?
+  ip         String?
+  createdAt  DateTime  @default(now())
+
+  @@index([phone, createdAt])
+  @@index([ip, createdAt])
+}
+
+// ───────────────────────────── Counter & ledger ─────────────────────────────
+
+// Proof that the member was present: issued by a counter lookup, consumed by one transaction.
+model LookupToken {
+  id         String    @id @default(cuid())
+  tokenHash  String    @unique
+  merchantId String
+  memberId   String
+  branchId   String
+  staffId    String
+  canRedeem  Boolean
+  expiresAt  DateTime
+  usedAt     DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([staffId, createdAt])
+}
+
+enum TransactionType {
+  earn
+  redeem
+  earn_and_redeem
+  void
+  adjust
+}
+
+// Append-only. Mistakes are corrected with a `void` row, never by editing.
+model Transaction {
+  id                  String          @id @default(cuid())
+  merchantId          String
+  memberId            String
+  branchId            String
+  staffId             String
+  type                TransactionType
+  invoiceRef          String?
+  billAmount          Decimal         @default(0) @db.Decimal(12, 2)
+  tierId              String?
+  tierDiscountPercent Decimal         @default(0) @db.Decimal(5, 2)
+  discountAmount      Decimal         @default(0) @db.Decimal(12, 2)
+  pointsDelta         Int             @default(0)
+  stampsDelta         Int             @default(0)
+  rewardRedeemed      Boolean         @default(false)
+  voidsTransactionId  String?         @unique
+  note                String?
+  createdAt           DateTime        @default(now())
+
+  merchant Merchant @relation(fields: [merchantId], references: [id])
+  member   Member   @relation(fields: [memberId], references: [id])
+
+  @@unique([merchantId, invoiceRef])
+  @@index([merchantId, createdAt])
+  @@index([memberId, createdAt])
+}
+
+model IdempotencyKey {
+  merchantId   String
+  key          String
+  requestHash  String
+  responseCode Int
+  responseBody Json
+  createdAt    DateTime @default(now())
+
+  @@id([merchantId, key])
+  @@index([createdAt])
+}
+
+// ───────────────────────────── Wallet & outbox ─────────────────────────────
+
+model WalletPass {
+  memberId     String    @id
+  externalId   String    @unique // id returned by wallet-api
+  apple        Boolean   @default(false)
+  google       Boolean   @default(false)
+  syncStatus   String    @default("ok") // ok | pending | failed
+  lastSyncedAt DateTime?
+
+  member Member @relation(fields: [memberId], references: [id], onDelete: Cascade)
+}
+
+enum OutboxStatus {
+  pending
+  done
+  failed
+}
+
+// Written in the same DB transaction as the change it describes; a worker delivers it (e.g. wallet pass update).
+model OutboxMessage {
+  id          String       @id @default(cuid())
+  topic       String // e.g. wallet.pass.update
+  payload     Json
+  status      OutboxStatus @default(pending)
+  attempts    Int          @default(0)
+  nextAttempt DateTime     @default(now())
+  lastError   String?
+  createdAt   DateTime     @default(now())
+
+  @@index([status, nextAttempt])
+}
+
+// Append-only log of everything that happened, for audit and analytics.
+model Event {
+  id         String   @id @default(cuid())
+  merchantId String
+  type       String // member.enrolled, transaction.created, transaction.voided, program.updated, ...
+  actorType  String // staff | member | system
+  actorId    String?
+  subjectId  String?
+  payload    Json
+  createdAt  DateTime @default(now())
+
+  merchant Merchant @relation(fields: [merchantId], references: [id])
+
+  @@index([merchantId, type, createdAt])
+}
