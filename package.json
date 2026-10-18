@@ -17,6 +17,7 @@
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
     "db:studio": "prisma studio",
+    "verify:odoo": "tsx scripts/verify-odoo-login.ts",
     "lint:spec": "npx -y @redocly/cli@1.25.0 lint openapi/openapi.yaml"
   },
   "dependencies": {
