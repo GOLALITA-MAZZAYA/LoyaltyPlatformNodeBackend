@@ -37,6 +37,16 @@ export class AuthService {
   async exchange(odooToken: string) {
     const vendor = await this.d.odoo.getVendorByToken(odooToken);
     if (!vendor) throw unauthorized('odoo_token_invalid', 'Golalita session is not valid');
+    this.d.log.info(
+      {
+        odooFields: vendor.fields,
+        odooUserId: vendor.odooUserId,
+        partnerId: vendor.partnerId,
+        role: vendor.isMainMember ? 'owner' : 'cashier',
+        hasMainMemberField: vendor.fields.includes('main_member'),
+      },
+      'odoo login mapped',
+    );
     if (!vendor.partnerId) {
       throw new AppError(403, 'not_a_merchant', 'This Golalita account is not linked to a merchant', {
         messageAr: 'هذا الحساب غير مرتبط بتاجر',

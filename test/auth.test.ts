@@ -9,9 +9,10 @@ beforeEach(async () => {
   await resetDb();
   await app?.close();
   ({ app, odoo } = await buildTestApp());
-  odoo.vendors.set('owner-token', { odooUserId: 101, partnerId: 4812, name: 'Cup & Go', isMainMember: true });
-  odoo.vendors.set('cashier-token', { odooUserId: 102, partnerId: 4812, name: 'Cashier Ali', isMainMember: false });
-  odoo.vendors.set('no-partner-token', { odooUserId: 103, partnerId: null, name: 'Nobody', isMainMember: true });
+  const fields = ['id', 'main_member', 'name', 'tracking_partner_id'];
+  odoo.vendors.set('owner-token', { odooUserId: 101, partnerId: 4812, name: 'Cup & Go', isMainMember: true, fields });
+  odoo.vendors.set('cashier-token', { odooUserId: 102, partnerId: 4812, name: 'Cashier Ali', isMainMember: false, fields });
+  odoo.vendors.set('no-partner-token', { odooUserId: 103, partnerId: null, name: 'Nobody', isMainMember: true, fields });
   odoo.branches.set(4812, [
     { odooBranchId: 1, name: 'Lusail', nameAr: 'لوسيل' },
     { odooBranchId: 2, name: 'Aspire', nameAr: null },

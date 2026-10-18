@@ -8,6 +8,8 @@ export interface OdooVendor {
   name: string;
   /** main_member: the merchant's main account (owner) vs a sub-user */
   isMainMember: boolean;
+  /** Field names in Odoo's reply (no values), for checking the mapping */
+  fields: string[];
 }
 
 export interface OdooBranch {
@@ -74,6 +76,7 @@ export class HttpOdooClient implements OdooClient {
       partnerId: partnerId && Number.isInteger(partnerId) ? partnerId : null,
       name: v.name || `User ${v.id}`,
       isMainMember: v.main_member === true,
+      fields: Object.keys(result).sort(),
     };
   }
 
