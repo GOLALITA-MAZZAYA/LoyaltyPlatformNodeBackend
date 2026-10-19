@@ -106,6 +106,8 @@ export const branchRoutes: FastifyPluginAsyncZod<BranchRouteOptions> = async (ap
       if (!branch) throw notFound('branch_not_found', 'Branch not found');
 
       const { merchant } = branch;
+      // Odoo names sometimes carry trailing dashes/spaces ("Al Falah Optics-"); keep posters clean.
+      const merchantName = merchant.name.replace(/[\s\-–—_.]+$/u, '') || merchant.name;
       const design = merchant.cardDesign;
       const [logo, tiers] = await Promise.all([
         design?.logoAssetId ? app.prisma.asset.findFirst({ where: { id: design.logoAssetId, merchantId: merchant.id } }) : null,
@@ -123,9 +125,9 @@ export const branchRoutes: FastifyPluginAsyncZod<BranchRouteOptions> = async (ap
         joinUrl,
         qrSvg,
         poster: {
-          merchantName: merchant.name,
-          headlineEn: `Join ${merchant.name} Rewards`,
-          headlineAr: `انضم إلى برنامج مكافآت ${merchant.name}`,
+          merchantName,
+          headlineEn: `Join ${merchantName} Rewards`,
+          headlineAr: `انضم إلى برنامج مكافآت ${merchantName}`,
           stepsEn: ['Scan the QR code with your phone camera', 'Enter your mobile number', 'Add your card to Apple or Google Wallet'],
           stepsAr: ['امسح الرمز بكاميرا هاتفك', 'أدخل رقم جوالك', 'أضف بطاقتك إلى محفظة Apple أو Google'],
           logoUrl: logo?.url ?? null,
