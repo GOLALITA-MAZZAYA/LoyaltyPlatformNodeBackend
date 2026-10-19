@@ -407,13 +407,19 @@ paths:
               schema: { $ref: '#/components/schemas/BranchQr' }
               example:
                 branchId: br_01J9Z
-                joinUrl: "https://join.golalita.com/j/cupgo/lsl7q?src=branch_qr"
+                branchName: Lusail
+                branchNameAr: لوسيل
+                joinUrl: "https://join.golalita.com/j/cup-go/lsl7q"
+                qrSvg: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 33 33\">…</svg>"
                 poster:
-                  headlineEn: "Join Cup & Go Loyalty Program"
-                  headlineAr: "انضم إلى برنامج الولاء"
+                  merchantName: "Cup & Go"
+                  headlineEn: "Join Cup & Go Rewards"
+                  headlineAr: "انضم إلى برنامج مكافآت Cup & Go"
+                  stepsEn: ["Scan the QR code with your phone camera", "Enter your mobile number", "Add your card to Apple or Google Wallet"]
+                  stepsAr: ["امسح الرمز بكاميرا هاتفك", "أدخل رقم جوالك", "أضف بطاقتك إلى محفظة Apple أو Google"]
                   logoUrl: "https://cdn.golalita.com/loyalty/mer_01J9Z/logo.png"
                   primaryColor: "#7E9D77"
-                  tiers: [{ nameEn: Green, discountPercent: 0 }, { nameEn: Silver, discountPercent: 10 }]
+                  tiers: [{ nameEn: Green, nameAr: أخضر, color: '#7E9D77', discountPercent: 0 }, { nameEn: Silver, nameAr: فضي, color: '#A8A9AD', discountPercent: 10 }]
         '404': { $ref: '#/components/responses/NotFound' }
 
   # ──────────────────────────── Counter ────────────────────────────
@@ -1137,17 +1143,24 @@ components:
 
     BranchQr:
       type: object
-      required: [branchId, joinUrl, poster]
+      required: [branchId, branchName, joinUrl, qrSvg, poster]
       properties:
         branchId: { type: string }
-        joinUrl: { type: string, format: uri }
+        branchName: { type: string }
+        branchNameAr: { type: [string, 'null'] }
+        joinUrl: { type: string, format: uri, description: "PUBLIC_JOIN_BASE_URL/j/{merchantCode}/{branchCode}. Permanent once printed." }
+        qrSvg: { type: string, description: "QR code of joinUrl as an SVG document (error correction M). The app renders it; no QR library needed." }
         poster:
           type: object
+          required: [merchantName, headlineEn, headlineAr, stepsEn, stepsAr, primaryColor, tiers]
           properties:
+            merchantName: { type: string }
             headlineEn: { type: string }
             headlineAr: { type: string }
-            logoUrl: { type: string, format: uri }
-            primaryColor: { type: string }
+            stepsEn: { type: array, items: { type: string } }
+            stepsAr: { type: array, items: { type: string } }
+            logoUrl: { type: [string, 'null'], format: uri }
+            primaryColor: { type: string, description: "Card design colour, or Golalita #8A1538 until set" }
             tiers:
               type: array
               items:
@@ -1155,10 +1168,8 @@ components:
                 properties:
                   nameEn: { type: string }
                   nameAr: { type: string }
+                  color: { type: string }
                   discountPercent: { type: number }
-                  spendThreshold: { $ref: '#/components/schemas/Money' }
-                  stampsRequired: { type: integer }
-
     MemberSummary:
       type: object
       required: [id, displayName, phoneMasked, tierId, points, stamps, status]

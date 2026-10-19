@@ -14,6 +14,7 @@ import { AuthService } from './modules/auth/service.js';
 import { authRoutes } from './modules/auth/routes.js';
 import { merchantRoutes } from './modules/merchant/routes.js';
 import { healthRoutes } from './modules/health/routes.js';
+import { branchRoutes } from './modules/branches/routes.js';
 
 export interface AppDeps {
   env?: Env;
@@ -54,6 +55,7 @@ export async function buildApp(deps: AppDeps = {}) {
     async (v1) => {
       await v1.register(authRoutes, { auth });
       await v1.register(merchantRoutes);
+      await v1.register(branchRoutes, { odoo, joinBaseUrl: env.PUBLIC_JOIN_BASE_URL });
     },
     { prefix: '/v1' },
   );
