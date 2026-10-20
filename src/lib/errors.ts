@@ -13,7 +13,7 @@ export class AppError extends Error {
     readonly status: number,
     readonly code: string,
     message: string,
-    readonly options: { messageAr?: string; errors?: FieldError[] } = {},
+    readonly options: { messageAr?: string; errors?: FieldError[]; extra?: Record<string, unknown> } = {},
   ) {
     super(message);
     this.name = 'AppError';
@@ -45,6 +45,7 @@ export function registerErrorHandler(app: FastifyInstance) {
         problem(error.status, error.code, error.message, {
           ...(error.options.messageAr && { messageAr: error.options.messageAr }),
           ...(error.options.errors && { errors: error.options.errors }),
+          ...error.options.extra,
         }),
       );
     }

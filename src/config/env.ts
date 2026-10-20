@@ -15,6 +15,12 @@ const schema = z.object({
     .default('')
     .transform((v) => v.split(',').map((s) => s.trim()).filter(Boolean)),
   PUBLIC_JOIN_BASE_URL: z.string().url(),
+  // How sign-up codes reach the customer. `dev` returns the code in the API response so it can be
+  // shown on the page during local testing; it is refused in production. `sms` needs a provider.
+  OTP_DELIVERY: z.enum(['sms', 'dev']).default('sms'),
+}).refine((e) => !(e.NODE_ENV === 'production' && e.OTP_DELIVERY === 'dev'), {
+  path: ['OTP_DELIVERY'],
+  message: 'OTP_DELIVERY=dev is not allowed when NODE_ENV=production',
 });
 
 export type Env = z.infer<typeof schema>;

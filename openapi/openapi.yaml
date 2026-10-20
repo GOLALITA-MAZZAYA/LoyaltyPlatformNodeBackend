@@ -588,7 +588,12 @@ paths:
       operationId: voidTransaction
       x-roles: [owner]
       summary: Reverse a transaction entered by mistake (owner only)
-      description: Writes a compensating ledger entry; the original is never edited or deleted. Balances may not go negative.
+      description: >-
+        Writes a compensating `void` entry with the opposite `stampsDelta` (and `rewardRedeemed` mirrored, so a
+        reversed redemption returns the stamps and lowers `rewardsRedeemed`). The original is never edited or
+        deleted (enforced by a database trigger). Releases the original's receipt so a corrected entry can reuse it;
+        the pass code and lookup stay used. 409 codes: `already_voided`, `cannot_void_reversal`,
+        `void_would_go_negative`. 404 `transaction_not_found` for an unknown or another merchant's transaction.
       parameters:
         - name: transactionId
           in: path
@@ -648,7 +653,8 @@ paths:
                   totals:
                     type: object
                     properties:
-                      members: { type: integer }
+                      members: { type: integer, description: All members of this merchant }
+                      matching: { type: integer, description: Members matching the current filters }
                       byTier:
                         type: object
                         additionalProperties: { type: integer }
@@ -675,6 +681,7 @@ paths:
       operationId: updateMemberStatus
       x-roles: [owner]
       summary: Block or unblock a member (owner only)
+      description: Blocking also signs the member out of their web card. Stamps and points are kept. Logged as an event.
       requestBody:
         required: true
         content:
@@ -745,8 +752,21 @@ paths:
                   otpRequestId: { type: string }
                   resendAfterSeconds: { type: integer }
                   expiresInSeconds: { type: integer }
+                  devCode:
+                    type: string
+                    description: Only when the server runs with OTP_DELIVERY=dev (local testing; refused in production). The code that would have been texted.
+        '404': { $ref: '#/components/responses/NotFound' }
         '422': { $ref: '#/components/responses/ValidationError' }
-        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '429':
+          description: "`rate_limited`, with `retryAfterSeconds`"
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          description: "`sms_not_configured`: no SMS provider is set up; nothing was sent and the request does not count toward limits"
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
 
   /public/otp/verify:
     post:
@@ -755,8 +775,9 @@ paths:
       summary: Verify the OTP and get a member session
       description: |
         If the phone is already a member of this merchant, returns that member (card recovery).
-        Otherwise returns `profileRequired: true`; the site must then call `PUT /public/me`.
-        Max 5 attempts per OTP.
+        Otherwise returns `profileRequired: true` with a short-lived (30 min) sign-up token in `memberToken`
+        that can only be used for `PUT /public/me`, which creates the member and returns the long-lived token.
+        Max 5 attempts per OTP; codes are 6 digits, valid 5 minutes, single use.
       security: []
       requestBody:
         required: true
@@ -804,10 +825,20 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/MemberCard' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: "`profile_required`: called with a sign-up token before `PUT /public/me`"
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
     put:
       tags: [Public sign-up]
       operationId: completeProfile
       summary: Create the membership with name and consent (new members)
+      description: |
+        New members start with 0 stamps and 0 points in the base tier; if the merchant has no tiers yet a
+        default base tier ("Member", no discount, 10-stamp card) is created. Stamps, points and tier cannot be set here.
+        Idempotent: if the phone is already a member (retry, race, or called with a member token) the existing
+        card is returned unchanged.
       security:
         - memberAuth: []
       requestBody:
@@ -823,36 +854,47 @@ paths:
                 email: { type: string, format: email }
                 birthDate: { type: string, format: date }
                 consentAccepted: { type: boolean, const: true }
-                consentVersion: { type: string, description: "Version of the merchant's terms shown on the page, stored with the consent" }
                 marketingOptIn: { type: boolean, default: false }
       responses:
         '200':
-          description: Member card
+          description: Member card. When called with a sign-up token it also carries the long-lived `memberToken`.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/MemberCard' }
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/MemberCard'
+                  - type: object
+                    properties:
+                      memberToken: { type: string }
+                      memberTokenExpiresAt: { type: string, format: date-time }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '422': { $ref: '#/components/responses/ValidationError' }
 
   /public/me/qr:
-    get:
+    post:
       tags: [Public sign-up]
-      operationId: getMyRotatingCode
-      summary: Short-lived code for the web card's QR (refresh every ~60 s)
+      operationId: issueMyPassCode
+      summary: Issue a single-use 90-second code for the web card's QR (refresh every 60 s while visible)
+      description: >-
+        POST because each call stores a new code; GET is not routed. Limited to 10 per minute and
+        120 per hour per member card. Blocked members get 401. Response has `Cache-Control: no-store`.
       security:
         - memberAuth: []
       responses:
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { description: "`profile_required`: sign-up token, card not created yet" }
+        '429': { description: "`rate_limited`: keep showing the current code until it expires" }
         '200':
           description: Code
           content:
             application/json:
               schema:
                 type: object
-                required: [code, expiresAt]
+                required: [code, expiresAt, qrDataUrl]
                 properties:
-                  code: { type: string, examples: ["glp1.eyJtIjoi…"] }
+                  code: { type: string, examples: ["glp1.Q2xhdWRlIGlzIGEgZ29vZCBib3kgYW5kIGhlbHBz"] }
                   expiresAt: { type: string, format: date-time }
+                  qrDataUrl: { type: string, description: PNG of the QR as a data URL }
 
   /public/me/wallet:
     get:
@@ -1063,7 +1105,9 @@ components:
         stampsRequired: { type: integer, minimum: 2, maximum: 20, description: "Buy N, get the next free" }
         rewardDescriptionEn: { type: string, maxLength: 60 }
         rewardDescriptionAr: { type: string, maxLength: 60 }
-        rewardMaxValue: { $ref: '#/components/schemas/Money' }
+        rewardMaxValue:
+          description: Optional cap on the free item's price, shown to customers and cashiers. Null means no cap. Display only, not enforced at redemption.
+          oneOf: [{ $ref: '#/components/schemas/Money' }, { type: 'null' }]
 
     TierInput:
       type: object
@@ -1177,8 +1221,14 @@ components:
         id: { type: string }
         displayName: { type: string }
         phoneMasked: { type: string, examples: ["+974 •••• 3456"] }
+        phone: { $ref: '#/components/schemas/Phone', description: Full number. Owners only; never sent to cashiers. }
         tierId: { type: string }
         tierNameEn: { type: string }
+        tierNameAr: { type: string }
+        tierColor: { type: string }
+        stampsRequired: { type: integer, description: 0 when the member's tier has no punch card }
+        joinedBranchId: { type: [string, 'null'] }
+        joinedBranchName: { type: [string, 'null'] }
         points: { type: integer }
         stamps: { type: integer }
         status: { type: string, enum: [active, blocked] }
@@ -1190,8 +1240,11 @@ components:
         - $ref: '#/components/schemas/MemberSummary'
         - type: object
           properties:
-            joinedBranchId: { type: string }
+            firstName: { type: string }
+            lastName: { type: [string, 'null'] }
             source: { type: string, enum: [branch_qr, cashier, other] }
+            marketingOptIn: { type: boolean }
+            transactionCount: { type: integer }
             windowSpend: { $ref: '#/components/schemas/Money' }
             lifetimeSpend: { $ref: '#/components/schemas/Money' }
             rewardsRedeemed: { type: integer }
@@ -1223,6 +1276,8 @@ components:
         stampsRequired: { type: integer }
         rewardAvailable: { type: boolean }
         rewardDescriptionEn: { type: string }
+        rewardMaxValue:
+          oneOf: [{ $ref: '#/components/schemas/Money' }, { type: 'null' }]
         nextTier:
           type: [object, 'null']
           properties:
@@ -1316,6 +1371,10 @@ components:
         stamps: { type: integer }
         stampsRequired: { type: integer }
         rewardAvailable: { type: boolean }
+        rewardDescEn: { type: [string, 'null'] }
+        rewardDescAr: { type: [string, 'null'] }
+        rewardMaxValue:
+          oneOf: [{ $ref: '#/components/schemas/Money' }, { type: 'null' }]
         tier:
           type: object
           properties:

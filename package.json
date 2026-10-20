@@ -18,6 +18,8 @@
     "db:deploy": "prisma migrate deploy",
     "db:studio": "prisma studio",
     "verify:odoo": "tsx scripts/verify-odoo-login.ts",
+    "check:ledger": "tsx --env-file=.env scripts/check-ledger.ts",
+    "cleanup": "tsx --env-file=.env scripts/cleanup.ts",
     "lint:spec": "npx -y @redocly/cli@1.25.0 lint openapi/openapi.yaml"
   },
   "dependencies": {

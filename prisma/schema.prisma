@@ -227,6 +227,7 @@ model Member {
   transactions Transaction[]
   memberTokens MemberToken[]
   walletPass   WalletPass?
+  passCodes    PassCode[]
 
   @@unique([merchantId, phone])
   @@index([merchantId, tierId])
@@ -265,6 +266,23 @@ model OtpRequest {
 // ───────────────────────────── Counter & ledger ─────────────────────────────
 
 // Proof that the member was present: issued by a counter lookup, consumed by one transaction.
+
+// Customer's rotating QR pass code for the counter scanner.
+model PassCode {
+  id         String    @id @default(cuid())
+  codeHash   String    @unique
+  merchantId String
+  memberId   String
+  expiresAt  DateTime
+  usedAt     DateTime?
+  createdAt  DateTime  @default(now())
+
+  member     Member    @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  @@index([memberId, expiresAt])
+  @@index([merchantId, createdAt])
+}
+
 model LookupToken {
   id         String    @id @default(cuid())
   tokenHash  String    @unique
@@ -272,6 +290,7 @@ model LookupToken {
   memberId   String
   branchId   String
   staffId    String
+  passCodeId String?
   canRedeem  Boolean
   expiresAt  DateTime
   usedAt     DateTime?
@@ -305,15 +324,29 @@ model Transaction {
   stampsDelta         Int             @default(0)
   rewardRedeemed      Boolean         @default(false)
   voidsTransactionId  String?         @unique
+  lookupTokenId       String?         @unique
+  passCodeId          String?         @unique
+  reason              String? // required on voids
   note                String?
   createdAt           DateTime        @default(now())
 
   merchant Merchant @relation(fields: [merchantId], references: [id])
   member   Member   @relation(fields: [memberId], references: [id])
 
-  @@unique([merchantId, invoiceRef])
   @@index([merchantId, createdAt])
   @@index([memberId, createdAt])
+}
+
+// One row per receipt in use. A void deletes its claim so a corrected entry can reuse the receipt.
+// scopeBranchId is the branch id (per-branch scope until decision B, docs/loyalty-scanner-spec.md).
+model InvoiceClaim {
+  merchantId    String
+  scopeBranchId String
+  invoiceRef    String
+  transactionId String   @unique
+  createdAt     DateTime @default(now())
+
+  @@id([merchantId, scopeBranchId, invoiceRef])
 }
 
 model IdempotencyKey {

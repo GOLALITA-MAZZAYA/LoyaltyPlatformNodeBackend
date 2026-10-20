@@ -1,5 +1,6 @@
 import { PrismaClient } from '@prisma/client';
 import { buildApp } from '../src/app.js';
+import { DevSmsSender, type SmsSender } from '../src/integrations/sms.js';
 import type { OdooBranch, OdooClient, OdooVendor } from '../src/integrations/odoo.js';
 
 export const prisma = new PrismaClient();
@@ -20,8 +21,8 @@ export class FakeOdoo implements OdooClient {
   }
 }
 
-export async function buildTestApp(odoo = new FakeOdoo()) {
-  const app = await buildApp({ prisma, odoo });
+export async function buildTestApp(odoo = new FakeOdoo(), sms: SmsSender = new DevSmsSender()) {
+  const app = await buildApp({ prisma, odoo, sms });
   await app.ready();
   return { app, odoo };
 }
